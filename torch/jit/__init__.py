@@ -17,6 +17,18 @@ import copy
 
 _flatten = torch._C._jit_flatten
 
+def _hack_compiled_function_isinstance():
+    pybind_metaclass = type(torch._C.CompiledFunction)
+    orig_instancecheck = pybind_metaclass.__instancecheck__
+    def __instancecheck__(cls, instance):
+        if cls is torch._C.CompiledFunction:
+            if hasattr(instance, '_compiled_fn'):
+                return type(instance._compiled_fn) is torch._C.CompiledFunction
+        return orig_instancecheck(cls, instance)
+    pybind_metaclass.__instancecheck__ = __instancecheck__
+
+_hack_compiled_function_isinstance()
+
 
 # This global variable is set when we are tracing a *forwards* computation.
 # It is intended to be a cheap way to test if tracing has occurred, before
@@ -163,10 +175,6 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
                 old_init = old_init.im_func
 
             def __init__(self, *args, **kwargs):
-                torch._C.CompiledFunction.__init__(self,
-                                                   nderivs, optimize, enabled,
-                                                   self.forward,
-                                                   arg.__name__)
                 try:
                     old_init(self, *args, **kwargs)
                 except TypeError as e:
@@ -177,18 +185,30 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
                                              "\n\nOriginal error: {}".format(str(e))), e)
                     else:
                         raise
-                # NOTE: This can't be done in CompiledFunction constructor,
-                # because self.parameters() isn't well defined by then
-                # (Module constructor hasn't run yet).
+                self._compiled_fn = torch._C.CompiledFunction(
+                                                   nderivs, optimize, enabled,
+                                                   self.forward,
+                                                   arg.__name__)
+                # TODO: put this in the constructor
                 self.set_captured_vars(list(self.parameters()))
 
-            new_dict = dict(arg.__dict__)
+            def make_property(name):
+                def compiled_property(self):
+                    return getattr(self._compiled_fn, name)
+                compiled_property.__name__ = name
+                return property(compiled_property)
+
+            new_dict = arg.__dict__.copy()
             new_dict['__init__'] = __init__
-            new_dict['__call__'] = torch._C.CompiledFunction.__call__
+            new_dict['__call__'] = lambda self, *args: self._compiled_fn(*args)
+            for name in [name for name in dir(torch._C.CompiledFunction) if not name.startswith('_')]:
+                if not hasattr(arg, name):
+                    new_dict[name] = make_property(name)
+
             # NOTE: we don't need to override casting methods, because we only capture
             # parameters, and they mutate their data in-place.
             return type(arg.__name__,
-                        arg.__bases__ + (torch._C.CompiledFunction,),
+                        arg.__bases__,
                         new_dict)
         elif isinstance(arg, Module):
             # It requires work to compile module instances, because you would
